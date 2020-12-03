@@ -14,7 +14,7 @@ void SetVectorToZeros(std::vector<double>& v) {
   }
 }
 
-}
+} // namespace
 
 double Grid3D::at(int i, int j, int k) const {
   return data_.at(LinearIndex(i, j, k));

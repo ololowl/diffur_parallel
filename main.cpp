@@ -21,6 +21,7 @@ namespace {
 double CalculateError(Grid3D actual, const Grid3D& expected) {
   actual -= expected;
   actual.ApplyAbs();
+  //actual.PrintGrid();
   return actual.Max();
 }
 
@@ -58,54 +59,58 @@ double AnalyticalUDerivT(Point<double> p, double t, Point<double> pL) {
 }
 
 Grid3D CreateGridEtalon(Point<double> p0, Point<double> pN, Point<int> n,
-                        Point<double> pL, double t, bool are_edges[6]) {
+                        Point<double> pL, double t, bool are_edges[6],
+                        int grid_size) {
+  Point<double> delta_x(pL.x / grid_size, 0, 0);
+  Point<double> delta_y(0, pL.y / grid_size, 0);
+
   Grid3D grid(p0, pN, n);
   omp_set_num_threads(NUM_TREADS);
   #pragma omp parallel for
-  for (int i = 0; i < n.x; ++i) {
-    #pragma omp parallel for
-    for (int j = 0; j < n.y; ++j) {
-      #pragma omp parallel for
-      for (int k = 0; k < n.z; ++k) {
+  for (int i = 1; i < n.x - 1; ++i) {
+    for (int j = 1; j < n.y - 1; ++j) {
+      for (int k = 1; k < n.z - 1; ++k) {
         grid.set(i, j, k) = AnalyticalU(grid.PointFromIndices(i, j, k), t, pL);
       }
     }
   }
+
   #pragma omp parallel for
   for (int y = 0; y < n.y; ++y) {
-    #pragma omp parallel for
     for (int z = 0; z < n.z; ++z) {
+      Point<double> zero = grid.PointFromIndices(0, y, z);
+      zero.x = 0;
+      Point<double> last = grid.PointFromIndices(0, y, z);
+      last.x = pL.x;
+      double value = (AnalyticalU(zero + delta_x, t, pL) +
+                      AnalyticalU(last - delta_x, t, pL)) / 2;
       if (are_edges[0]) {
-        grid.set(0, y, z) =
-          (grid.at(1, y, z) +
-           AnalyticalU(grid.PointFromIndices(n.x - 2, y, z), t, pL)) / 2;
+        grid.set(0, y, z) = value;
       }
       if (are_edges[3]) {
-        grid.set(n.x - 1, y, z) =
-          (grid.at(n.x - 2, y, z) + 
-           AnalyticalU(grid.PointFromIndices(1, y, z), t, pL)) / 2;
+        grid.set(n.x - 1, y, z) = value;
       }
     }
   }
   #pragma omp parallel for
   for (int x = 0; x < n.x; ++x) {
-    #pragma omp parallel for
     for (int z = 0; z < n.z; ++z) {
+      Point<double> zero = grid.PointFromIndices(x, 0, z);
+      zero.y = 0;
+      Point<double> last = grid.PointFromIndices(x, 0, z);
+      last.y = pL.y;
+      double value = (AnalyticalU(zero + delta_y, t, pL) +
+                      AnalyticalU(last - delta_y, t, pL)) / 2;
       if (are_edges[1]) {
-        grid.set(x, 0, z) =
-          (grid.at(x, 1, z) +
-           AnalyticalU(grid.PointFromIndices(x, n.y - 2, z), t, pL)) / 2;
+        grid.set(x, 0, z) = value;
       }
       if (are_edges[4]) {
-        grid.set(x, n.y - 1, z) =
-          (grid.at(x, n.y - 2, z) +
-           AnalyticalU(grid.PointFromIndices(x, 1, z), t, pL)) / 2;
+        grid.set(x, n.y - 1, z) = value;
       }
     }
   }
   #pragma omp parallel for
   for (int x = 0; x < n.x; ++x) {
-    #pragma omp parallel for
     for (int y = 0; y < n.y; ++y) {
       if (are_edges[2]) {
         grid.set(x, y, 0) = 0;
@@ -119,8 +124,8 @@ Grid3D CreateGridEtalon(Point<double> p0, Point<double> pN, Point<int> n,
 }
 
 Grid3D CreateGridT0(Point<double> p0, Point<double> pN, Point<int> n,
-                    Point<double> pL, bool are_edges[6]) {
-  return CreateGridEtalon(p0, pN, n, pL, /*t=*/0, are_edges);
+                    Point<double> pL, bool are_edges[6], int grid_size) {
+  return CreateGridEtalon(p0, pN, n, pL, /*t=*/0, are_edges, grid_size);
 }
 
 // in and out are required to be the same in terms of all fields except data_.
@@ -131,9 +136,7 @@ void Laplassian7Points(const Grid3D& in, Grid3D& out) {
   omp_set_num_threads(NUM_TREADS);
   #pragma omp parallel for
   for (int x = 1; x < n.x - 1; ++x) {
-    #pragma omp parallel for
     for (int y = 1; y < n.y - 1; ++y) {
-      #pragma omp parallel for
       for (int z = 1; z < n.z - 1; ++z) {
         const double xyz = 2 * in.at(x, y, z);
         out.set(x, y, z) = (in.at(x-1, y, z) - xyz + in.at(x+1, y, z)) / delta.x +
@@ -176,7 +179,7 @@ void Calculate3Dimensions(int world_size, int dimensions[3]);
 int main(int argc, char* argv[]) {
   // PARAMETER
   double L = 1.0;
-  int grid_axis_size = 40; // along one axis
+  int grid_axis_size = 512; // along one axis
 
   const Point<double> pL(L, L, L);
 
@@ -215,8 +218,8 @@ int main(int argc, char* argv[]) {
   
   for (int i = 0; i < 3; ++i) {
     int tmp;
-    MPI_Cart_shift(cartComm, i, -1, &tmp, left_neighbours + i);
-    MPI_Cart_shift(cartComm, i, 1, &tmp, right_neighbours + i);
+    MPI_Cart_shift(cartComm, i, 1, &tmp, left_neighbours + i);
+    MPI_Cart_shift(cartComm, i, -1, &tmp, right_neighbours + i);
 
     // if global edges -- neighbour is other edge (or self, if dim size == 1)
     if (left_neighbours[i] == MPI_PROC_NULL) {
@@ -232,6 +235,22 @@ int main(int argc, char* argv[]) {
       MPI_Cart_rank(cartComm, tmp, right_neighbours + i);
     }
   }
+  /*
+  std::stringstream ss;
+  ss << "rank " << rank << " ";
+  ss << "left neighbours [" << left_neighbours[0] << ", " << left_neighbours[1]
+     << ", " << left_neighbours[2] << "], ";
+  ss << "right neighbours [" << right_neighbours[0] << ", " << right_neighbours[1]
+     << ", " << right_neighbours[2] << "], ";
+  ss << "are_edges ";
+  for (int i = 0; i < 6; ++i) {
+    ss << are_edges[i] << " ";
+  }
+  ss << "\n";
+  std::cout << ss.str();*/
+  //MPI_Finalize();
+  //return 0;
+
 
   // borders indices {x y z}
   Point<double> global_part_sizes(L / dimensions[0],
@@ -247,7 +266,8 @@ int main(int argc, char* argv[]) {
                                    grid_axis_size / dimensions[2]);
 
   // Create grid for t=9
-  Grid3D grid_t0 = CreateGridT0(p0, pN, local_grid_num_points, pL, are_edges);
+  Grid3D grid_t0 = CreateGridT0(p0, pN, local_grid_num_points, pL, are_edges,
+                                grid_axis_size);
   
   // Initialize tau & t info
   const int num_time_points = 20;
@@ -263,7 +283,11 @@ int main(int argc, char* argv[]) {
   UpdateEdges(grid_t0, grid_t0, grid_t1, tau / std::sqrt(2), left_neighbours,
               right_neighbours, are_edges, coords3d, dimensions, cartComm);
   errors[1] = CalculateError(
-    CreateGridEtalon(p0, pN, local_grid_num_points, pL, tau, are_edges), grid_t1);
+    CreateGridEtalon(p0, pN, local_grid_num_points, pL, tau, are_edges,
+                     grid_axis_size), grid_t1);
+  //CreateGridEtalon(p0, pN, local_grid_num_points, pL, tau, are_edges,
+    //                 grid_axis_size).PrintGrid();
+  //grid_t1.PrintGrid();
 
   Grid3D grid_t2(p0, pN, local_grid_num_points);
 
@@ -276,8 +300,11 @@ int main(int argc, char* argv[]) {
     UpdateEdges(*in_prev, *in, *out, tau, left_neighbours, right_neighbours,
                 are_edges, coords3d, dimensions, cartComm);
     errors[t] = CalculateError(
-      CreateGridEtalon(p0, pN, local_grid_num_points, pL, tau, are_edges), *out);
-
+      CreateGridEtalon(p0, pN, local_grid_num_points, pL, tau * t, are_edges,
+                       grid_axis_size), *out);
+    //CreateGridEtalon(p0, pN, local_grid_num_points, pL, tau * t, are_edges,
+      //                 grid_axis_size).PrintGrid();
+    //out->PrintGrid();
     Grid3D* tmp = in_prev;
     in_prev = in;
     in = out;
@@ -340,27 +367,24 @@ void UpdateEdges(const Grid3D& in_prev, const Grid3D& in, Grid3D& out, double ta
   // init send bufs
   // x
   #pragma omp parallel for
-  for (int y = 1; y < n.y - 1; ++y) {
-    #pragma omp parallel for
-    for (int z = 1; z < n.z - 1; ++z) {
+  for (int y = 0; y < n.y; ++y) {
+    for (int z = 0; z < n.z; ++z) {
       left_send_buf[0][y * n.z + z] = out.at(1, y, z);
       right_send_buf[0][y * n.z + z] = out.at(n.x - 2, y, z);
     }
   }
   // y
   #pragma omp parallel for
-  for (int x = 1; x < n.x - 1; ++x) {
-    #pragma omp parallel for
-    for (int z = 1; z < n.z - 1; ++z) {
+  for (int x = 0; x < n.x; ++x) {
+    for (int z = 0; z < n.z; ++z) {
       left_send_buf[1][x * n.z + z] = out.at(x, 1, z);
       right_send_buf[1][x * n.z + z] = out.at(x, n.y - 2, z);
     }
   }
   // z
   #pragma omp parallel for
-  for (int x = 1; x < n.x - 1; ++x) {
-    #pragma omp parallel for
-    for (int y = 1; y < n.y - 1; ++y) {
+  for (int x = 0; x < n.x; ++x) {
+    for (int y = 0; y < n.y; ++y) {
       left_send_buf[2][x * n.y + y] = out.at(x, y, 1);
       right_send_buf[2][x * n.y + y] = out.at(x, y, n.z - 2);
     }
@@ -401,12 +425,11 @@ void UpdateEdges(const Grid3D& in_prev, const Grid3D& in, Grid3D& out, double ta
   
   #pragma omp parallel for
   for (int y = 1; y < n.y - 1; ++y) {
-    #pragma omp parallel for
     for (int z = 1; z < n.z - 1; ++z) {
       // left
       int x = 0;
       if (are_edges[0]) { // left global edge
-        out.set(x, y, z) = (out.left_xyz[0][y * n.z + z] + out.at(x + 1, y, z)) / 2;
+        out.set(x, y, z) = 0;//(out.left_xyz[0][y * n.z + z] + out.at(x + 1, y, z)) / 2;
       } else { // local
         double xyz = 2 * in.at(x, y, z);
         double lapl = 
@@ -418,7 +441,7 @@ void UpdateEdges(const Grid3D& in_prev, const Grid3D& in, Grid3D& out, double ta
       // right
       x = n.x - 1;
       if (are_edges[3]) { // right global edge
-        out.set(x, y, z) = (out.right_xyz[0][y * n.z + z] + out.at(x - 1, y, z)) / 2;
+        out.set(x, y, z) = 0;//(out.right_xyz[0][y * n.z + z] + out.at(x - 1, y, z)) / 2;
       } else { // local
         double xyz = 2 * in.at(x, y, z);
         double lapl = 
@@ -432,12 +455,11 @@ void UpdateEdges(const Grid3D& in_prev, const Grid3D& in, Grid3D& out, double ta
   // y
   #pragma omp parallel for
   for (int x = 1; x < n.x - 1; ++x) {
-    #pragma omp parallel for
     for (int z = 1; z < n.z - 1; ++z) {
       // left
       int y = 0;
       if (are_edges[1]) { // left global edge
-        out.set(x, y, z) = (out.left_xyz[1][x * n.z + z] + out.at(x, y + 1, z)) / 2;
+        out.set(x, y, z) = 0;// (out.left_xyz[1][x * n.z + z] + out.at(x, y + 1, z)) / 2;
       } else { // local
         double xyz = 2 * in.at(x, y, z);
         double lapl = 
@@ -449,7 +471,7 @@ void UpdateEdges(const Grid3D& in_prev, const Grid3D& in, Grid3D& out, double ta
       // right
       y = n.y - 1;
       if (are_edges[4]) { // right global edge
-        out.set(x, y, z) = (out.right_xyz[1][x * n.z + z] + out.at(x, y - 1, z)) / 2;
+        out.set(x, y, z) = 0;//(out.right_xyz[1][x * n.z + z] + out.at(x, y - 1, z)) / 2;
       } else { // local
         double xyz = 2 * in.at(x, y, z);
         double lapl = 
@@ -463,7 +485,6 @@ void UpdateEdges(const Grid3D& in_prev, const Grid3D& in, Grid3D& out, double ta
   // z ( const 0 for global)
   #pragma omp parallel for
   for (int x = 1; x < n.x - 1; ++x) {
-    #pragma omp parallel for
     for (int y = 1; y < n.y - 1; ++y) {
       // left
       int z = 0;
