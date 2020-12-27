@@ -30,7 +30,7 @@ Grid3D Grid3D::operator+(const Grid3D& other) const {
     throw std::invalid_argument(message);
   }
 
-  Grid3D result(p0_, pN_, num_points_);
+  Grid3D result(p0_, pN_, num_points_, delta_);
   for (size_t idx = 0; idx < data_.size(); ++idx) {
     result.data_[idx] = data_[idx] + other.data_[idx];
   }
@@ -54,7 +54,7 @@ Grid3D Grid3D::operator-(const Grid3D& other) const {
     throw std::invalid_argument(message);
   }
 
-  Grid3D result(p0_, pN_, num_points_);
+  Grid3D result(p0_, pN_, num_points_, delta_);
   for (size_t idx = 0; idx < data_.size(); ++idx) {
     result.data_[idx] = data_[idx] - other.data_[idx];
   }
@@ -73,7 +73,7 @@ void Grid3D::operator-=(const Grid3D& other) {
 }
 
 Grid3D Grid3D::operator*(double multiplier) const {
-  Grid3D result(p0_, pN_, num_points_);
+  Grid3D result(p0_, pN_, num_points_, delta_);
   for (size_t idx = 0; idx < data_.size(); ++idx) {
     result.data_[idx] = data_[idx] * multiplier;
   }
@@ -87,7 +87,9 @@ void Grid3D::operator*=(double multiplier) {
 }
 
 Point<double> Grid3D::PointFromIndices(int i, int j, int k) {
-  return Point<double>(p0_.x + i * delta_.x, p0_.y + j * delta_.y, p0_.z + k * delta_.z);
+  return Point<double>(p0_.x + i * delta_.x,
+                       p0_.y + j * delta_.y,
+                       p0_.z + k * delta_.z);
 }
 
 void Grid3D::PrintGrid() const {
@@ -97,7 +99,7 @@ void Grid3D::PrintGrid() const {
     if (idx > 0 && idx % (num_points_.z * num_points_.y) == 0) std::cout << "\n";
     std::cout << data_[idx] << " ";
   }*/
-  std::cout << "[";
+  std::cout << "size "  << num_points_.DebugString() << "\n[";
   for (int y = 0; y < num_points_.y; ++y) {
     std::cout << "[";
     for (int z = 0; z < num_points_.z; ++z) {
@@ -150,26 +152,37 @@ double Grid3D::Max() const {
       counter = 1;
     }
   }
+  /*for (int i = 1; i < num_points_.x - 1; ++i) {
+    for (int j = 1; j < num_points_.y - 1; ++j) {
+      for (int k = 1; k < num_points_.z - 1; ++k) {
+        int idx = LinearIndex(i, j, k);
+        if (std::fabs(data_[idx] - res) < 1e-7) {
+          counter++;
+        }
+        if (data_[idx] > res) {
+          res = data_[idx];
+          coord = i;
+          counter = 1;
+        }
+      }
+    }
+  }*/
   int x = coord / (num_points_.y * num_points_.z);
   int y = (coord % (num_points_.y * num_points_.z)) / num_points_.z;
   int z = (coord % (num_points_.y * num_points_.z)) % num_points_.z;
 
-  //std::cout << "MAX COORD " << coord << ", x " << x << ", y " << y <<
-    //           ", z " << z << " counter " << counter << "\n";
+  {
+    std::stringstream ss;
+    ss << "MAX COORD " << coord << ", x " << x << ", y " << y << ", z "
+       << z << " counter " << counter << " value " << res << "\n";
+    //std::cout << ss.str();
+  }
   return res;
 }
 
 void Grid3D::ApplyAbs() {
   for (size_t i = 0; i < data_.size(); ++i) {
     data_[i] = std::fabs(data_[i]);
-  }
-}
-
-void Grid3D::Clear() {
-  SetVectorToZeros(data_);
-  for (int i = 0; i < 3; ++i) {
-    SetVectorToZeros(left_xyz[i]);
-    SetVectorToZeros(right_xyz[i]);
   }
 }
 

@@ -1,8 +1,8 @@
 #ifndef GRID_H
 #define GRID_H
 
-#include <iostream>
 #include <cmath>
+#include <iostream>
 #include <sstream>
 #include <vector>
 
@@ -89,16 +89,10 @@ class Grid3D {
   std::vector<std::vector<double> > left_xyz;
   std::vector<std::vector<double> > right_xyz;
 
-  Grid3D(Point<double> p0, Point<double> pN, int n)
-    : data_(n * n * n, 0), num_points_(n, n, n), p0_(p0), pN_(pN),
-      delta_((pN - p0) / (n - 1)) {
-    InitVectors();
-  }
-  Grid3D(Point<double> p0, Point<double> pN, Point<int> n)
-    : data_(n.x * n.y * n.z, 0), num_points_(n), p0_(p0), pN_(pN),
-      delta_((pN - p0).x / (n - 1).x,
-             (pN - p0).y / (n - 1).y,
-             (pN - p0).z / (n - 1).z) {
+  Grid3D(Point<double> p0, Point<double> pN, Point<int> axis_num_points,
+         Point<double> delta)
+    : data_(axis_num_points.x * axis_num_points.y * axis_num_points.z, 0),
+      num_points_(axis_num_points), p0_(p0), pN_(pN), delta_(delta) {
     InitVectors();
   }
 
