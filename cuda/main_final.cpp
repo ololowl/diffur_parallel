@@ -89,26 +89,33 @@ class Point {
 };
 
 // 3 dimensional grid (x, y, z) with corresponding indices (i, j, k). Area of
-// coverage is (0, xL] x (0, yL] x (0, zL). Only cubical grids are suported:
-// Number of points is equal for each axis and is passed in the constructor as n.
+// coverage is (0, xL] x (0, yL] x (0, zL].
 class Grid3D {
  public:
-  std::vector<std::vector<double> > left_xyz;
-  std::vector<std::vector<double> > right_xyz;
-
-  Grid3D(Point<double> p0, Point<double> pN, Point<int> axis_num_points,
+  Grid3D(Point<double> p0, Point<double> pN, Point<int> n,
          Point<double> delta)
-    : data_(axis_num_points.x * axis_num_points.y * axis_num_points.z, 0),
-      num_points_(axis_num_points), p0_(p0), pN_(pN), delta_(delta) {
-    InitVectors();
+    : data_size_(n.x * n.y * n.z), num_points_(n), starts_(0, 0, 0),
+      edge_sizes_(n.y * n.z, n.x * n.z, n.x * n.y), p0_(p0), pN_(pN),
+      delta_(delta) {
+    cudaMalloc(&data_, data_size_ * sizeof(double));
+    
+
+    starts_.y = edge_sizes_.x;
+    starts_.z = starts_.y + edge_sizes_.y;
+    
+    cudaMalloc(&left_, (starts_.z + edge_sizes_.z) * sizeof(double));
+    
+    cudaMalloc(&right_, (starts_.z + edge_sizes_.z) * sizeof(double));
+    
   }
 
-  Grid3D(const Grid3D& other)
-    : left_xyz(other.left_xyz), right_xyz(other.right_xyz), data_(other.data_),
-      num_points_(other.num_points_), p0_(other.p0_), pN_(other.pN_),
-      delta_(other.delta_) {
+  ~Grid3D() {
+    cudaFree(data_);
+    cudaFree(left_);
+    cudaFree(right_);
   }
 
+  /*
   double at(int i, int j, int k) const;
   double& set(int i, int j, int k);
 
@@ -121,33 +128,48 @@ class Grid3D {
   Grid3D operator*(double multiplier) const;
   void operator*=(double multiplier);
 
-  Point<double> PointFromIndices(int i, int j, int k);
-
   void PrintGrid() const;
   void PrintDelta() const;
-
   std::string DebugString() const;
-
+  
   double Sum() const;
   double Max() const;
   void ApplyAbs();
+  */
 
-  void Clear();
+  void SetData(const std::vector<double>& new_data);
 
+  Point<double> PointFromIndices(int i, int j, int k);
+  int LinearIndex(int i, int j, int k) const;
+
+  double* data() { return data_; }
+  double* left() { return left_; }
+  double* right() { return right_; }
+
+  int data_size() const { return data_size_; }
   Point<int> size() const { return num_points_; }
-  Point<double> delta() const { return delta_; }
+  Point<int> starts() const { return starts_; }
+  Point<int> edge_sizes() const { return edge_sizes_; }
+
   Point<double> p0() const { return p0_; }
   Point<double> pN() const { return pN_; }
-  std::vector<double> data() const { return data_; }
+  Point<double> delta() const { return delta_; }
 
  private:
-  int LinearIndex(int i, int j, int k) const;
-  std::string CompareGridMetaData(const Grid3D& other) const;
-  void InitVectors();
+  //std::string CompareGridMetaData(const Grid3D& other) const;
 
-  std::vector<double> data_;
+  // actual grid
+  double* data_;
+  int data_size_;
   Point<int> num_points_; // number of points along each axis
 
+  // edges from neighbour processors
+  double* left_;
+  double* right_;
+  Point<int> starts_;
+  Point<int> edge_sizes_;
+
+  // meta
   Point<double> p0_; // start borders of intervals
   Point<double> pN_; // end borders of intervals
   Point<double> delta_; // deltas between grid points
@@ -155,37 +177,62 @@ class Grid3D {
 
 } // namespace grid
 
-namespace error {
+namespace cuda_buffers {
 
-double* in_data_;
-double* out_data_;
-size_t* data_size_;
+struct CudaInfo {
+  size_t data_size;
+  int size_x, size_y, size_z;
+  double delta_x, delta_y, delta_z;
+  double tau;
 
-void alloc_variables(const grid::Grid3D& in) {
-  size_t size = in.data().size();
+  CudaInfo(size_t ds, const grid::Point<int>& s, const grid::Point<double>& d,
+           double t, bool left, bool right)
+    : data_size(ds), size_x(s.x), size_y(s.y), size_z(s.z),
+      delta_x(d.x), delta_y(d.y), delta_z(d.z), tau(t) {}
+};
+
+CudaInfo* cuda_info_;
+
+bool* are_edges_;
+
+double* left_;
+double* right_;
+
+void AllocVariables(grid::Grid3D& in, double tau, bool are_edges[6]) {
+  CudaInfo info(in.data_size(), in.size(), in.delta(), tau, are_edges[4],
+                are_edges[5]);
+
+  cudaMalloc(&cuda_info_, sizeof(info));
+  cudaMemcpy(
+    cuda_info_, &info, sizeof(info), cudaMemcpyHostToDevice);
   
-  cudaMalloc(&data_size_, sizeof(size_t));
-  cudaMemcpy(data_size_, &size, sizeof(size_t), cudaMemcpyHostToDevice);
+  cudaMalloc(&are_edges_, 6 * sizeof(bool));
+  cudaMemcpy(are_edges_, &are_edges, 6 * sizeof(bool), cudaMemcpyHostToDevice);
 
-  cudaMalloc(&in_data_, size * sizeof(double));
-  cudaMalloc(&out_data_, size * sizeof(double));
+  int edge_full_size = in.edge_sizes().x + in.edge_sizes().y + in.edge_sizes().z;
+  cudaMalloc(&left_, edge_full_size * sizeof(double));
+  cudaMalloc(&right_, edge_full_size * sizeof(double));
 }
 
-void free_variables() {
-  cudaFree(in_data_);
-  cudaFree(out_data_);
-  cudaFree(data_size_);
+void FreeVariables() {
+  cudaFree(cuda_info_);
+  cudaFree(are_edges_);
 }
 
+} // namespace cuda_buffers
+
+namespace cuda_kernels {
+
+// calculates abs(in_data - out_data) pointwise and writes to out_data
 __global__ void error_kernel(double* in_data, double* out_data,
-                             size_t* data_size) {
+                             cuda_buffers::CudaInfo* info) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
   int z = blockIdx.z * blockDim.z + threadIdx.z;
   int idx = x;
   if (y > idx) idx = y;
   if (z > idx) idx = z;
-  if (idx >= *data_size) {
+  if (idx >= info->data_size) {
     return;
   }
 
@@ -200,30 +247,31 @@ __global__ void error_kernel(double* in_data, double* out_data,
   out_data[idx] = value;
 }
 
-} // namespace error
+} // namespace cuda_kernels
 
+/*
 double CalculateError(const grid::Grid3D& actual,
                       const grid::Grid3D& expected) {
-  /*
   grid::Grid3D delta = actual - expected;
   delta.ApplyAbs();
   return delta.Max();
-  */
-  size_t size = actual.data().size();
+}*/
 
-  cudaMemcpy(error::in_data_, actual.data().data(),
-             size * sizeof(double), cudaMemcpyHostToDevice);
-  cudaMemcpy(error::out_data_, expected.data().data(),
-             size * sizeof(double), cudaMemcpyHostToDevice);
+// actual -- pointer to data in gpu device memory
+// expected -- grid in host memory
+double CalculateErrorCuda(grid::Grid3D& actual, grid::Grid3D& expected) {
+  size_t size = actual.data_size();
 
   dim3 block_dim(1024, 1, 1);
   dim3 grid_dim((size + 1023) / 1024, 1, 1);
-  error::error_kernel<<<grid_dim, block_dim>>>(
-    error::in_data_, error::out_data_, error::data_size_);
+  cuda_kernels::error_kernel<<<grid_dim, block_dim>>>(
+    actual.data(), expected.data(), cuda_buffers::cuda_info_);
+  
 
   std::vector<double> tmp(size, 0);
-  cudaMemcpy(tmp.data(), error::out_data_,
-             size * sizeof(double), cudaMemcpyDeviceToHost);
+  cudaMemcpy(tmp.data(), expected.data(), size * sizeof(double),
+             cudaMemcpyDeviceToHost);
+  
 
   double max_value = tmp[0];
   for (size_t i = 1; i < size; ++i) {
@@ -260,17 +308,18 @@ double AnalyticalU(const grid::Point<double>& p, double t,
   return sin(insin.x) * sin(insin.y) * sin(insin.z) * std::cos(at * t + M_PI);
 }
 
-grid::Grid3D CreateGridEtalon(const grid::Point<double>& p0,
-                              const grid::Point<double>& pN,
-                              const grid::Point<int>& n,
-                              const grid::Point<double>& pL, double t,
-                              bool are_edges[6],
-                              const grid::Point<double>& delta) {
-  grid::Grid3D grid(p0, pN, n, delta);
-  for (int i = 1; i < n.x - 1; ++i) {
-    for (int j = 1; j < n.y - 1; ++j) {
-      for (int k = 1; k < n.z - 1; ++k) {
-        grid.set(i, j, k) = AnalyticalU(grid.PointFromIndices(i, j, k), t, pL);
+void SetGridEtalon(grid::Grid3D& grid, const grid::Point<double>& pL,
+                   double t, bool are_edges[6]) {
+  grid::Point<int> n = grid.size();
+  grid::Point<double> delta = grid.delta();
+
+  std::vector<double> data(grid.data_size(), 0);
+
+  for (int i = 0; i < n.x; ++i) {
+    for (int j = 0; j < n.y; ++j) {
+      for (int k = 0; k < n.z; ++k) {
+        data[grid.LinearIndex(i, j, k)] =
+          AnalyticalU(grid.PointFromIndices(i, j, k), t, pL);
       }
     }
   }
@@ -284,10 +333,10 @@ grid::Grid3D CreateGridEtalon(const grid::Point<double>& p0,
       double value = (AnalyticalU(zero, t, pL) +
                       AnalyticalU(last, t, pL)) / 2;
       if (are_edges[0]) {
-        grid.set(0, y, z) = value;
+        data[grid.LinearIndex(0, y, z)] = value;
       }
       if (are_edges[3]) {
-        grid.set(n.x - 1, y, z) = value;
+        data[grid.LinearIndex(n.x - 1, y, z)] = value;
       }
     }
   }
@@ -300,210 +349,101 @@ grid::Grid3D CreateGridEtalon(const grid::Point<double>& p0,
       double value = (AnalyticalU(zero, t, pL) +
                       AnalyticalU(last, t, pL)) / 2;
       if (are_edges[1]) {
-        grid.set(x, 0, z) = value;
+        data[grid.LinearIndex(x, 0, z)] = value;
       }
       if (are_edges[4]) {
-        grid.set(x, n.y - 1, z) = value;
+        data[grid.LinearIndex(x, n.y - 1, z)] = value;
       }
     }
   }
   for (int x = 0; x < n.x; ++x) {
     for (int y = 0; y < n.y; ++y) {
       if (are_edges[2]) {
-        grid.set(x, y, 0) = 0;
+        data[grid.LinearIndex(x, y, 0)] = 0;
       }
       if (are_edges[5]) {
-        grid.set(x, y, n.z - 1) = 0;
+        data[grid.LinearIndex(x, y, n.z - 1)] = 0;
       }
     }
   }
-  return grid;
+  grid.SetData(data);
 }
 
-grid::Grid3D CreateGridT0(const grid::Point<double> p0,
-                          const grid::Point<double> pN,
-                          const grid::Point<int> n,
-                          const grid::Point<double> pL,
-                          bool are_edges[6], const grid::Point<double> delta) {
-  return CreateGridEtalon(p0, pN, n, pL, /*t=*/0, are_edges, delta);
+void SetGridT0(grid::Grid3D& grid, const grid::Point<double> pL,
+                          bool are_edges[6]) {
+  SetGridEtalon(grid, pL, /*t=*/0, are_edges);
 }
 
-namespace laplassian {
-
-struct CudaInfo {
-  size_t data_size;
-  int size_x, size_y, size_z;
-  double delta_x, delta_y, delta_z;
-
-  CudaInfo(size_t ds, const std::vector<int>& s,
-           const grid::Point<double>& d)
-    : data_size(ds), size_x(s[0]), size_y(s[1]), size_z(s[2]), delta_x(d.x),
-      delta_y(d.y), delta_z(d.z) {}
-};
+namespace cuda_kernels {
 
 __global__ void laplassian_kernel(double* in_data, double* out_data,
-                                  CudaInfo* info,
-                                  //double* in_x_left, double* in_x_right,
-                                  //double* in_y_left, double* in_y_right,
-                                  //double* in_z_left, double* in_z_right
+                                  cuda_buffers::CudaInfo* info,
                                   double* left, double* right);
 
-CudaInfo* cuda_info_;
-double* in_data_;
-double* out_data_;
-
-double* left_;
-double* right_;
-size_t edge_size_sum_;
-
-double* left_data_;
-double* right_data_;
-
-void alloc_variables(const grid::Grid3D& in) {
-  std::cout << "LAPL ALLOC\n";
-  cudaMalloc(&cuda_info_, sizeof(CudaInfo));
-  std::cout << cudaGetErrorString(cudaGetLastError()) << "\n";
-  cudaMalloc(&in_data_, sizeof(double) * in.data().size());
-  std::cout << cudaGetErrorString(cudaGetLastError()) << "\n";
-  cudaMalloc(&out_data_, sizeof(double) * in.data().size());
-  std::cout << cudaGetErrorString(cudaGetLastError()) << "\n";
-
-  edge_size_sum_ = in.left_xyz[0].size() +
-                   in.left_xyz[1].size() +
-                   in.left_xyz[2].size();
-  left_ = new double[edge_size_sum_];
-  right_ = new double[edge_size_sum_];
-  std::cout << "edge_size_sum_ " << edge_size_sum_ << "\n";
-
-  cudaMalloc(&left_data_, edge_size_sum_ * sizeof(double));
-  std::cout << cudaGetErrorString(cudaGetLastError()) << "\n";
-  cudaMalloc(&right_data_, edge_size_sum_ * sizeof(double));
-  std::cout << cudaGetErrorString(cudaGetLastError()) << "\n";
-
-  std::vector<int> edge_size{in.size().x,
-                                in.size().y,
-                                in.size().z};
-  laplassian::CudaInfo info(in.data().size(), edge_size, in.delta());
-  std::cout << "sizes " << info.size_x << " " << info.size_y << " "
-            << info.size_z << "\n";
-  cudaMemcpy(
-    laplassian::cuda_info_, &info, sizeof(info), cudaMemcpyHostToDevice);
-  std::cout << cudaGetErrorString(cudaGetLastError()) << "\n";
-}
-
-void free_variables() {
-  cudaFree(cuda_info_);
-  cudaFree(in_data_);
-  cudaFree(out_data_);
-
-  delete[] left_;
-  delete[] right_;
-
-  cudaFree(left_data_);
-  cudaFree(right_data_);
-}
-
-} // namespace laplassian
+} // namespace cuda_kernels
 
 // in and out are required to be the same in terms of all fields except data_.
-void Laplassian7Points(const grid::Grid3D& in, grid::Grid3D& out) {
-  cudaMemcpy(laplassian::in_data_, in.data().data(),
-             sizeof(double) * in.data().size(), cudaMemcpyHostToDevice);
-
-  // yz, xz, xy
-  int starts[3] = {0,
-                   in.size().y * in.size().z,
-                   in.size().y * in.size().z + in.size().x * in.size().z};
-
-  for (int i = 0; i < 3; ++i) {
-    memcpy(laplassian::left_ + starts[i],
-           in.left_xyz[i].data(),
-           in.left_xyz[i].size() * sizeof(double));
-    memcpy(laplassian::right_ + starts[i],
-           in.right_xyz[i].data(),
-           in.right_xyz[i].size() * sizeof(double));
-  }
-
-  cudaMemcpy(
-    laplassian::left_data_, laplassian::left_,
-    laplassian::edge_size_sum_ * sizeof(double), cudaMemcpyHostToDevice);
-  cudaMemcpy(
-    laplassian::right_data_, laplassian::right_,
-    laplassian::edge_size_sum_ * sizeof(double), cudaMemcpyHostToDevice);
-
+void Laplassian7PointsCuda(grid::Grid3D& in, grid::Grid3D& out) {
   dim3 block_dim(8, 8, 16);
   dim3 grid_dim((in.size().x + 7) / 8,
                 (in.size().y + 7) / 8,
                 (in.size().z + 15) / 16);
-  laplassian::laplassian_kernel<<<grid_dim, block_dim>>>(
-    laplassian::in_data_, laplassian::out_data_, laplassian::cuda_info_,
-    //left[0], left[1], left[2], right[0], right[1], right[2]
-    laplassian::left_data_, laplassian::right_data_);
-  std::cout << "lapl " << cudaGetErrorString(cudaGetLastError()) << "\n";
-
-  cudaMemcpy(out.data().data(), laplassian::out_data_,
-             sizeof(double) * out.data().size(), cudaMemcpyDeviceToHost);
+  cuda_kernels::laplassian_kernel<<<grid_dim, block_dim>>>(
+    in.data(), out.data(), cuda_buffers::cuda_info_, in.left(), in.right());
+  
 }
 
 // Process edges. For global edges: periodical law for x & y (equality of
 // values and derivatives), constant 0 for z. For local just laplassian etc.
 // *_neghbours --> [x, y, z]
-void UpdateEdges(const grid::Grid3D& in_prev, const grid::Grid3D& in,
-                 grid::Grid3D& out, double tau, int left_neighbours[3],
+void UpdateEdges(grid::Grid3D& out, int left_neighbours[3],
                  int right_neighbours[3], bool are_edges[6], int coords3d[3],
                  int dimensions[3], const MPI_Comm& cartComm);
 
-// Calculates edges only for corresponding edges of {global_edges, local_edges}
-// set to true.
-void CalculateEdges(const grid::Grid3D& in_prev, const grid::Grid3D& in,
-                    grid::Grid3D& out, bool are_edges[6], double tau,
-                    bool global_edges, bool local_edges);
+void CalculateGlobalEdges(grid::Grid3D& out);
+
+namespace cuda_kernels {
+
+__global__ void edges_kernel(double* out_data, double* are_edges, double* left,
+                             double* right, cuda_buffers::CudaInfo* info);
+
+__global__ void t1_kernel(double* t0, double* out,
+                          cuda_buffers::CudaInfo* info) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int z = blockIdx.z * blockDim.z + threadIdx.z;
+  int idx = x;
+  if (y > idx) idx = y;
+  if (z > idx) idx = z;
+  if (idx >= info->data_size) {
+    return;
+  }
+
+  double value = out[idx];
+  value *= info->tau * info->tau / 2;
+  value += t0[idx];
+  out[idx] = value;
+}
+
+} // namespace cuda_kernels
 
 // Applies laplassian operator to t0. Edges should be updated by caller.
-grid::Grid3D CreateGridT1(const grid::Grid3D& grid_t0, double tau) {
-  grid::Grid3D grid(grid_t0);
-  grid::Grid3D laplassian(
-    grid_t0.p0(), grid_t0.pN(), grid_t0.size(), grid_t0.delta());
+void SetGridT1(grid::Grid3D& grid_t0, grid::Grid3D& grid_t1) {
+  Laplassian7PointsCuda(grid_t0, grid_t1);
 
-  Laplassian7Points(grid, laplassian);
-
-  return (grid + laplassian * (tau * tau / 2));
+  //return (grid_t0 + laplassian * (tau * tau / 2));
+  dim3 block_dim(1024, 1, 1);
+  dim3 grid_dim((grid_t0.data_size() + 1023) / 1024, 1, 1);
+  cuda_kernels::t1_kernel<<<grid_dim, block_dim>>>(
+    grid_t0.data(), grid_t1.data(), cuda_buffers::cuda_info_);
+  
 }
 
-namespace step {
-
-struct CudaInfo {
-  double tau;
-  size_t data_size;
-
-  CudaInfo(double t, size_t ds) : tau(t), data_size(ds) {}
-};
-
-double* in_prev_data_;
-double* in_data_;
-double* out_data_;
-CudaInfo* cuda_info_;
-
-void alloc_variables(const grid::Grid3D& in, double tau) {
-  CudaInfo info(tau, in.data().size());
-
-  cudaMalloc(&cuda_info_, sizeof(CudaInfo));
-  cudaMemcpy(cuda_info_, &info, sizeof(CudaInfo), cudaMemcpyHostToDevice);
-
-  cudaMalloc(&in_prev_data_, info.data_size * sizeof(double));
-  cudaMalloc(&in_data_, info.data_size * sizeof(double));
-  cudaMalloc(&out_data_, info.data_size * sizeof(double));
-}
-
-void free_variables() {
-  cudaFree(in_prev_data_);
-  cudaFree(in_data_);
-  cudaFree(out_data_);
-  cudaFree(cuda_info_);
-}
+namespace cuda_kernels {
 
 __global__ void step_kernel(double* in_prev_data, double* in_data,
-                            double* out_data, CudaInfo* cuda_info) {
+                            double* out_data,
+                            cuda_buffers::CudaInfo* cuda_info) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
   int z = blockIdx.z * blockDim.z + threadIdx.z;
@@ -521,46 +461,16 @@ __global__ void step_kernel(double* in_prev_data, double* in_data,
   out_data[idx] = value;
 }
 
-} // namespace step
+} // namespace cuda_kernels
 
-// arguments: u_{n-1}, u_n, u_{n+1}
-// edges have to be processed by caller afterwards
-void Step(const grid::Grid3D& in_prev, const grid::Grid3D& in,
-          grid::Grid3D& out, double tau) {
-  Laplassian7Points(in, out);
-  /*
-  out *= (tau * tau);
-  out += in * 2.;
-  out -= in_prev;
-  return;
-  */
-  cudaMemcpy(step::in_prev_data_, in_prev.data().data(),
-             in_prev.data().size() * sizeof(double), cudaMemcpyHostToDevice);
-  cudaMemcpy(step::in_data_, in.data().data(),
-             in.data().size() * sizeof(double), cudaMemcpyHostToDevice);
-  cudaMemcpy(step::out_data_, out.data().data(),
-             out.data().size() * sizeof(double), cudaMemcpyHostToDevice);
+void StepCuda(grid::Grid3D& in_prev, grid::Grid3D& in, grid::Grid3D& out) {
+  Laplassian7PointsCuda(in, out);
 
   dim3 block_dim(1024, 1, 1);
-  dim3 grid_dim((in.data().size() + 1023) / 1024, 1, 1);
-  step::step_kernel<<<grid_dim, block_dim>>>(
-    step::in_prev_data_, step::in_data_, step::out_data_, step::cuda_info_);
-
-  cudaMemcpy(out.data().data(), step::out_data_,
-             out.data().size() * sizeof(double), cudaMemcpyDeviceToHost);
+  dim3 grid_dim((in.data_size() + 1023) / 1024, 1, 1);
+  cuda_kernels::step_kernel<<<grid_dim, block_dim>>>(
+    in_prev.data(), in.data(), out.data(), cuda_buffers::cuda_info_);
   
-}
-
-void alloc_all(const grid::Grid3D& grid_t0, double tau) {
-  laplassian::alloc_variables(grid_t0);
-  step::alloc_variables(grid_t0, tau);
-  error::alloc_variables(grid_t0);
-}
-
-void free_all() {
-  laplassian::free_variables();
-  step::free_variables();
-  error::free_variables();
 }
 
 void Calculate3Dimensions(int world_size, int dimensions[3]);
@@ -656,26 +566,30 @@ int main(int argc, char* argv[]) {
                    pN_point.z * delta.z);
 
   // Create grid for t=0
-  grid::Grid3D grid_t0 =
-    CreateGridT0(p0, pN, local_grid_num_points, pL, are_edges, delta);
+  grid::Grid3D grid_t0(p0, pN, local_grid_num_points, delta);
+  SetGridT0(grid_t0, pL, are_edges);
+
   // Initialize tau & t info
   const int num_time_points = 20;
   std::vector<double> errors(num_time_points, 0);
   double tau = grid_t0.delta().Min();
-  tau = tau * tau / 10;
+  tau = tau * tau / 20;
 
-  alloc_all(grid_t0, tau);
-
+  cuda_buffers::AllocVariables(grid_t0, tau, are_edges);
+  
   // Create grid for t=1 and calculate error with etalon
-  grid::Grid3D grid_t1 = CreateGridT1(grid_t0, tau);
+  grid::Grid3D grid_t1(p0, pN, local_grid_num_points, delta);
+  SetGridT1(grid_t0, grid_t1);
+
   // general formula for updates inside u(n+1) = tau^2 * laplassian + 2u(n) - u(n-1).
   // so if u(n) == u(n-1) == grid_t0, tau = tau / sqrt(2), we get
   // u1 = tau^2 / 2 * laplassian + u0
-  UpdateEdges(grid_t0, grid_t0, grid_t1, tau / std::sqrt(2), left_neighbours,
-              right_neighbours, are_edges, coords3d, dimensions, cartComm);
-  errors[1] = CalculateError(
-    CreateGridEtalon(p0, pN, local_grid_num_points, pL, tau, are_edges,
-                     delta), grid_t1);
+  UpdateEdges(grid_t1, left_neighbours, right_neighbours, are_edges, coords3d,
+              dimensions, cartComm);
+
+  grid::Grid3D etalon(p0, pN, local_grid_num_points, delta);
+
+  errors[1] = CalculateErrorCuda(grid_t1, etalon);
 
   grid::Grid3D grid_t2(p0, pN, local_grid_num_points, delta);
 
@@ -684,12 +598,13 @@ int main(int argc, char* argv[]) {
   grid::Grid3D* out = &grid_t2;
 
   for (int t = 2; t < num_time_points; ++t) {
-    Step(*in_prev, *in, *out, tau);
-    UpdateEdges(*in_prev, *in, *out, tau, left_neighbours, right_neighbours,
-                are_edges, coords3d, dimensions, cartComm);
-    errors[t] = CalculateError(
-      CreateGridEtalon(p0, pN, local_grid_num_points, pL, tau * t, are_edges,
-                       delta), *out);
+    StepCuda(*in_prev, *in, *out);
+    UpdateEdges(*out, left_neighbours, right_neighbours, are_edges, coords3d,
+                dimensions, cartComm);
+
+    SetGridEtalon(etalon, pL, t, are_edges);
+    errors[t] = CalculateErrorCuda(*out, etalon);
+
     grid::Grid3D* tmp = in_prev;
     in_prev = in;
     in = out;
@@ -721,18 +636,15 @@ int main(int argc, char* argv[]) {
     std::cout << ss.str();
   }
 
-  free_all();
+  cuda_buffers::FreeVariables();
   MPI_Finalize();
   return 0;
 }
 
-namespace laplassian {
+namespace cuda_kernels {
 
 __global__ void laplassian_kernel(double* in_data, double* out_data,
-                                  CudaInfo* info,
-                                  //double* in_x_left, double* in_x_right,
-                                  //double* in_y_left, double* in_y_right,
-                                  //double* in_z_left, double* in_z_right
+                                  cuda_buffers::CudaInfo* info,
                                   double* left, double* right) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -803,10 +715,76 @@ __global__ void laplassian_kernel(double* in_data, double* out_data,
                          (z_left - xyz + z_right) / delta_z;
 }
 
-} // namespace laplassian
+// send second to edge elements if global edges, and edge elements for local edges.
+__global__ void write_edges_kernel(double* data, double* left, double* right,
+                              cuda_buffers::CudaInfo* info, bool* are_edges) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int z = blockIdx.z * blockDim.z + threadIdx.z;
 
-void UpdateEdges(const grid::Grid3D& in_prev, const grid::Grid3D& in,
-                 grid::Grid3D& out, double tau, int left_neighbours[3],
+  if (x == 0 || x == info->size_x - 1 || y == 0 || y == info->size_y - 1 ||
+      z == 0 || z == info->size_z - 1) {
+    // OK
+  } else {
+    return;
+  }
+
+  int yz_size = info->size_y * info->size_z;
+  int xz_size = info->size_x * info->size_z;
+
+  int linear_idx = x * yz_size + y * info->size_z + z;
+  if (linear_idx >= info->data_size) { return; }
+
+  int indices[3] = {y * info->size_z + z,
+                    yz_size + x * info->size_z + z,
+                    yz_size + xz_size + x * info->size_y + y};
+  if (x == 0) {
+    if (are_edges[0]) { // global left
+      left[indices[0]] = data[linear_idx + yz_size];
+    } else {
+      left[indices[0]] = data[linear_idx];
+    }
+  }
+  if (x == info->size_x) {
+    if (are_edges[3]) { // global right
+      right[indices[0]] = data[linear_idx - yz_size];
+    } else {
+      right[indices[0]] = data[linear_idx];
+    }
+  }
+  if (y == 0) {
+    if (are_edges[1]) { // global left
+      left[indices[1]] = data[linear_idx + info->size_z];
+    } else {
+      left[indices[1]] = data[linear_idx];
+    }
+  }
+  if (y == info->size_y) {
+    if (are_edges[4]) { // global right
+      right[indices[1]] = data[linear_idx - info->size_z];
+    } else {
+      right[indices[1]] = data[linear_idx];
+    }
+  }
+  if (z == 0) {
+    if (are_edges[2]) { // global left
+      left[indices[2]] = data[linear_idx + 1];
+    } else {
+      left[indices[2]] = data[linear_idx];
+    }
+  }
+  if (z == info->size_z) {
+    if (are_edges[5]) { // global right
+      right[indices[2]] = data[linear_idx - 1];
+    } else {
+      right[indices[2]] = data[linear_idx];
+    }
+  }
+}
+
+} // namespace cuda_kernels
+
+void UpdateEdges(grid::Grid3D& out, int left_neighbours[3],
                  int right_neighbours[3], bool are_edges[6], int coords3d[3],
                  int dimensions[3], const MPI_Comm& cartComm) {
   const grid::Point<int> n = out.size();
@@ -814,13 +792,10 @@ void UpdateEdges(const grid::Grid3D& in_prev, const grid::Grid3D& in,
   std::vector<MPI_Request> send_requests(6); // left first, right last
   std::vector<MPI_Request> recv_requests(6); // left first, right last
 
-  // first calculate local edges, as we already have enough info (they use info
-  // only from in)
-  //CalculateEdges(in_prev, in, out, are_edges, tau, /*global_edges=*/false,
-  //               /*local_edges=*/true);
-
   // create bufs
-  int sizes[3] = {n.y * n.z, n.x * n.z, n.x * n.y};
+  int sizes[3] = {out.edge_sizes().x, out.edge_sizes().y, out.edge_sizes().z};
+  int starts[3] = {out.starts().x, out.starts().y, out.starts().z};
+
   std::vector<double*> left_send_buf(3);
   std::vector<double*> right_send_buf(3);
 
@@ -834,52 +809,20 @@ void UpdateEdges(const grid::Grid3D& in_prev, const grid::Grid3D& in,
     left_recv_buf[i] = new double[sizes[i]];
     right_recv_buf[i] = new double[sizes[i]];
   }
-  // init send bufs. we send second to edge elements if global edges, and edge
-  // elements for local edges.
-  // x
-  for (int y = 0; y < n.y; ++y) {
-    for (int z = 0; z < n.z; ++z) {
-      if (are_edges[0]) {
-        left_send_buf[0][IndexYZ(y, z, n)] = out.at(1, y, z);
-      } else {
-        left_send_buf[0][IndexYZ(y, z, n)] = out.at(0, y, z);
-      }
-      if (are_edges[3]) {
-        right_send_buf[0][IndexYZ(y, z, n)] = out.at(n.x - 2, y, z);
-      } else {
-        right_send_buf[0][IndexYZ(y, z, n)] = out.at(n.x - 1, y, z);
-      }
-    }
-  }
-  // y
-  for (int x = 0; x < n.x; ++x) {
-    for (int z = 0; z < n.z; ++z) {
-      if (are_edges[1]) {
-        left_send_buf[1][IndexXZ(x, z, n)] = out.at(x, 1, z);
-      } else {
-        left_send_buf[1][IndexXZ(x, z, n)] = out.at(x, 0, z);
-      }
-      if (are_edges[4]) {
-        right_send_buf[1][IndexXZ(x, z, n)] = out.at(x, n.y - 2, z);
-      } else {
-        right_send_buf[1][IndexXZ(x, z, n)] = out.at(x, n.y - 1, z);
-      }
-    }
-  }
-  // z
-  for (int x = 0; x < n.x; ++x) {
-    for (int y = 0; y < n.y; ++y) {
-      if (are_edges[2]) {
-        left_send_buf[2][IndexXY(x, y, n)] = out.at(x, y, 1);
-      } else {
-        left_send_buf[2][IndexXY(x, y, n)] = out.at(x, y, 0);
-      }
-      if (are_edges[5]) {
-        right_send_buf[2][IndexXY(x, y, n)] = out.at(x, y, n.z - 2);
-      } else {
-        right_send_buf[2][IndexXY(x, y, n)] = out.at(x, y, n.z - 1);
-      }
-    }
+  // init send bufs.
+  dim3 block_dim(8, 8, 16);
+  dim3 grid_dim((out.size().x + 7) / 8,
+                (out.size().y + 7) / 8,
+                (out.size().z + 15) / 16);
+  cuda_kernels::write_edges_kernel<<<grid_dim, block_dim>>>(
+    out.data(), cuda_buffers::left_, cuda_buffers::right_,
+    cuda_buffers::cuda_info_, cuda_buffers::are_edges_);
+
+  for (int i = 0; i < 3; ++i) {
+    cudaMemcpy(left_send_buf[i], cuda_buffers::left_ + starts[i],
+               sizes[i] * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(right_send_buf[i], cuda_buffers::right_ + starts[i],
+               sizes[i] * sizeof(double), cudaMemcpyDeviceToHost);
   }
 
   // send recv
@@ -905,15 +848,14 @@ void UpdateEdges(const grid::Grid3D& in_prev, const grid::Grid3D& in,
 
   // save received points
   for (int i = 0; i < 3; ++i) {
-    for (int idx = 0; idx < sizes[i]; ++idx) {
-      out.left_xyz[i][idx] = left_recv_buf[i][idx];
-      out.right_xyz[i][idx] = right_recv_buf[i][idx];
-    }
+    cudaMemcpy(out.left() + starts[i], left_recv_buf[i],
+               sizes[i] * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(out.right() + starts[i], right_recv_buf[i],
+               sizes[i] * sizeof(double), cudaMemcpyHostToDevice);
   }
   
   // now we only have to calculate global edges, using newly received info
-  CalculateEdges(in_prev, in, out, are_edges, tau, /*global_edges=*/true,
-                 /*local_edges=*/false);  
+  CalculateGlobalEdges(out);  
 
   for (int i = 0; i < 3; ++i) {
     delete[] left_send_buf[i];
@@ -923,103 +865,81 @@ void UpdateEdges(const grid::Grid3D& in_prev, const grid::Grid3D& in,
   }
 }
 
-void CalculateEdges(const grid::Grid3D& in_prev, const grid::Grid3D& in,
-                    grid::Grid3D& out, bool are_edges[6], double tau,
-                    bool global_edges, bool local_edges) {
-  const grid::Point<int> n = out.size();
-  // x
-  const grid::Point<double> delta = in.delta() * in.delta();
+namespace cuda_kernels {
+
+__global__ void edges_kernel(double* out_data, bool* are_edges, double* left,
+                             double* right, cuda_buffers::CudaInfo* info) {
+  bool needed = false;
+  for (int i = 0; i < 6; ++i) {
+    needed = needed || are_edges[i];
+  }
+  if (!needed) {
+    return;
+  }
+
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+  if (x == 0 || x == info->size_x - 1 || y == 0 || y == info->size_y - 1 ||
+      z == 0 || z == info->size_z - 1) {
+    // OK
+  } else {
+    return;
+  }
+
+  int yz_size = info->size_y * info->size_z;
+  int xz_size = info->size_x * info->size_z;
+
+  int linear_idx = x * yz_size + y * info->size_z + z;
+
+  if (linear_idx >= info->data_size) {
+    return;
+  }
+
+  if (x == 0 && are_edges[0]) {
+    double x_left = left[y * info->size_z + z];
+    x_left += out_data[linear_idx + yz_size]; // x+1, y, z
+    out_data[linear_idx] = x_left / 2;
+  }
+  if (x == info->size_x - 1 && are_edges[3]) {
+    double x_right = right[y * info->size_z + z];
+    x_right += out_data[linear_idx - yz_size]; // x-1, y, z
+    out_data[linear_idx] = x_right / 2;
+  }
+  if (y == 0 && are_edges[1]) {
+    double y_left = left[yz_size + x * info->size_z + z];
+    y_left += out_data[linear_idx + info->size_z]; // x, y+1, z
+    out_data[linear_idx] = y_left / 2;
+  }
+  if (y == info->size_y - 1 && are_edges[4]) {
+    double y_right = right[yz_size + x * info->size_z + z];
+    y_right += out_data[linear_idx - info->size_z]; // x, y-1, z
+    out_data[linear_idx] = y_right / 2;
+  }
+  if (z == 0 && are_edges[2]) {
+    double z_left = left[yz_size + xz_size + x * info->size_y + y];
+    z_left += out_data[linear_idx + 1]; // x, y, z+1
+    out_data[linear_idx] = z_left / 2;
+  }
+  if (z == info->size_z - 1 && are_edges[5]) {
+    double z_right = right[yz_size + xz_size + x * info->size_y + y];
+    z_right += out_data[linear_idx - 1]; // x, y, z-1
+    out_data[linear_idx] = z_right / 2;
+  }
+}
+
+} // namespace cuda_kernels
+
+void CalculateGlobalEdges(grid::Grid3D& out) {
+  dim3 block_dim(8, 8, 16);
+  dim3 grid_dim((out.size().x + 7) / 8,
+                (out.size().y + 7) / 8,
+                (out.size().z + 15) / 16);
+  cuda_kernels::edges_kernel<<<grid_dim, block_dim>>>(
+    out.data(), cuda_buffers::are_edges_, out.left(), out.right(),
+    cuda_buffers::cuda_info_);
   
-  for (int y = 1; y < n.y - 1; ++y) {
-    for (int z = 1; z < n.z - 1; ++z) {
-      // left
-      int x = 0;
-      if (are_edges[0] && global_edges) { // left global edge
-        out.set(x, y, z) =
-          (out.left_xyz[0][IndexYZ(y, z, n)] + out.at(x + 1, y, z)) / 2;
-      } else if (local_edges) { // local
-        //double xyz = 2 * in.at(x, y, z);
-        //double lapl = 
-        //  (in.left_xyz[0][IndexYZ(y, z, n)] - xyz + in.at(x + 1, y, z)) / delta.x +
-        //  (in.at(x, y - 1, z) - xyz + in.at(x, y + 1, z)) / delta.y +
-        //  (in.at(x, y, z - 1) - xyz + in.at(x, y, z + 1)) / delta.z;
-        //out.set(x, y, z) = xyz - in_prev.at(x, y, z) + tau * tau * lapl;
-      }
-      // right
-      x = n.x - 1;
-      if (are_edges[3] && global_edges) { // right global edge
-        out.set(x, y, z) =
-          (out.right_xyz[0][IndexYZ(y, z, n)] + out.at(x - 1, y, z)) / 2;
-      } else if (local_edges) { // local
-        //double xyz = 2 * in.at(x, y, z);
-        //double lapl = 
-        //  (in.at(x - 1, y, z) - xyz + in.right_xyz[0][IndexYZ(y, z, n)]) / delta.x +
-        //  (in.at(x, y - 1, z) - xyz + in.at(x, y + 1, z)) / delta.y +
-        //  (in.at(x, y, z - 1) - xyz + in.at(x, y, z + 1)) / delta.z;
-        //out.set(x, y, z) = xyz - in_prev.at(x, y, z) + tau * tau * lapl;
-      }
-    }
-  }
-  // y
-  for (int x = 1; x < n.x - 1; ++x) {
-    for (int z = 1; z < n.z - 1; ++z) {
-      // left
-      int y = 0;
-      if (are_edges[1] && global_edges) { // left global edge
-        out.set(x, y, z) =
-          (out.left_xyz[1][IndexXZ(x, z, n)] + out.at(x, y + 1, z)) / 2;
-      } else if (local_edges) { // local
-        //double xyz = 2 * in.at(x, y, z);
-        //double lapl = 
-        //  (in.at(x - 1, y, z) - xyz + in.at(x + 1, y, z)) / delta.x +
-        //  (in.left_xyz[1][IndexXZ(x, z, n)] - xyz + in.at(x, y + 1, z)) / delta.y +
-        //  (in.at(x, y, z - 1) - xyz + in.at(x, y, z + 1)) / delta.z;
-        //out.set(x, y, z) = xyz - in_prev.at(x, y, z) + tau * tau * lapl;
-      }
-      // right
-      y = n.y - 1;
-      if (are_edges[4] && global_edges) { // right global edge
-        out.set(x, y, z) =
-          (out.right_xyz[1][IndexXZ(x, z, n)] + out.at(x, y - 1, z)) / 2;
-      } else if (local_edges) { // local
-        //double xyz = 2 * in.at(x, y, z);
-        //double lapl = 
-        //  (in.at(x - 1, y, z) - xyz + in.at(x + 1, y, z)) / delta.x +
-        //  (in.at(x, y - 1, z) - xyz + in.right_xyz[1][IndexXZ(x, z, n)]) / delta.y +
-        //  (in.at(x, y, z - 1) - xyz + in.at(x, y, z + 1)) / delta.z;
-        //out.set(x, y, z) = xyz - in_prev.at(x, y, z) + tau * tau * lapl;
-      }
-    }
-  }
-  // z ( const 0 for global)
-  for (int x = 1; x < n.x - 1; ++x) {
-    for (int y = 1; y < n.y - 1; ++y) {
-      // left
-      int z = 0;
-      if (are_edges[2] && global_edges) { // left global edge
-        out.set(x, y, z) = 0;
-      } else if (local_edges) { // local
-        //double xyz = 2 * in.at(x, y, z);
-        //double lapl = 
-        //  (in.at(x - 1, y, z) - xyz + in.at(x + 1, y, z)) / delta.x +
-        //  (in.at(x, y - 1, z) - xyz + in.at(x, y + 1, z)) / delta.y +
-        //  (in.left_xyz[2][IndexXY(x, y, n)] - xyz + in.at(x, y, z + 1)) / delta.z;
-        //out.set(x, y, z) = xyz - in_prev.at(x, y, z) + tau * tau * lapl;
-      }
-      // right 
-      z = n.z - 1;
-      if (are_edges[5] && global_edges) { // right global edge
-        out.set(x, y, z) = 0;
-      } else if (local_edges) { // local
-        //double xyz = 2 * in.at(x, y, z);
-        //double lapl = 
-        //  (in.at(x - 1, y, z) - xyz + in.at(x + 1, y, z)) / delta.x +
-        //  (in.at(x, y - 1, z) - xyz + in.at(x, y + 1, z)) / delta.y +
-        //  (in.at(x, y, z - 1) - xyz + in.right_xyz[2][IndexXY(x, y, n)]) / delta.z;
-        //out.set(x, y, z) = xyz - in_prev.at(x, y, z) + tau * tau * lapl; 
-      } 
-    }
-  }
 }
 
 void Calculate3Dimensions(int world_size, int dimensions[3]) {
@@ -1029,15 +949,20 @@ void Calculate3Dimensions(int world_size, int dimensions[3]) {
       dimensions[1] = 1;
       dimensions[2] = 1;
       break;
+    case 2:
+      dimensions[0] = 1;
+      dimensions[1] = 1;
+      dimensions[2] = 2;
+      break;
     case 3:
       dimensions[0] = 1;
       dimensions[1] = 1;
       dimensions[2] = 3;
       break;
     case 4:
-      dimensions[0] = 2;
+      dimensions[0] = 1;
       dimensions[1] = 2;
-      dimensions[2] = 1;
+      dimensions[2] = 2;
       break;
     case 6:
       dimensions[0] = 2;
@@ -1088,6 +1013,41 @@ void Calculate3Dimensions(int world_size, int dimensions[3]) {
 }
 
 namespace grid {
+
+void Grid3D::SetData(const std::vector<double>& new_data) {
+  cudaMemcpy(data_, new_data.data(), data_size_ * sizeof(double),
+             cudaMemcpyHostToDevice);
+  
+}
+
+Point<double> Grid3D::PointFromIndices(int i, int j, int k) {
+  return Point<double>(p0_.x + i * delta_.x,
+                       p0_.y + j * delta_.y,
+                       p0_.z + k * delta_.z);
+}
+
+int Grid3D::LinearIndex(int i, int j, int k) const {
+  return i * num_points_.y * num_points_.z + j * num_points_.z + k;
+}
+
+/*
+std::string Grid3D::CompareGridMetaData(const Grid3D& other) const {
+  if (num_points_ != other.num_points_) {
+    return "grids have different number of points";
+  }
+  if (data_.size() != other.data_.size()) {
+    return "grids have different sizes";
+  }
+  if (p0_ != other.p0_) {
+    return "grids have different start points";
+  }
+  if (pN_ != other.pN_) {
+    return "grids have different end points";
+  } if (delta_ != other.delta_) {
+    return "grids have different delta between points";
+  }
+  return "OK";
+}
 
 double Grid3D::at(int i, int j, int k) const {
   return data_.at(LinearIndex(i, j, k));
@@ -1159,19 +1119,7 @@ void Grid3D::operator*=(double multiplier) {
   }
 }
 
-Point<double> Grid3D::PointFromIndices(int i, int j, int k) {
-  return Point<double>(p0_.x + i * delta_.x,
-                       p0_.y + j * delta_.y,
-                       p0_.z + k * delta_.z);
-}
-
 void Grid3D::PrintGrid() const {
-  /*std::cout << "grid: size " << data_.size() << "\n";
-  for (size_t idx = 0; idx < data_.size(); ++idx) {
-    if (idx > 0 && idx % num_points_.z == 0) std::cout << "\n";
-    if (idx > 0 && idx % (num_points_.z * num_points_.y) == 0) std::cout << "\n";
-    std::cout << data_[idx] << " ";
-  }*/
   std::cout << "size "  << num_points_.DebugString() << "\n[";
   for (int y = 0; y < num_points_.y; ++y) {
     std::cout << "[";
@@ -1225,7 +1173,7 @@ double Grid3D::Max() const {
       counter = 1;
     }
   }
-  /*for (int i = 1; i < num_points_.x - 1; ++i) {
+  for (int i = 1; i < num_points_.x - 1; ++i) {
     for (int j = 1; j < num_points_.y - 1; ++j) {
       for (int k = 1; k < num_points_.z - 1; ++k) {
         int idx = LinearIndex(i, j, k);
@@ -1239,7 +1187,7 @@ double Grid3D::Max() const {
         }
       }
     }
-  }*/
+  }
   int x = coord / (num_points_.y * num_points_.z);
   int y = (coord % (num_points_.y * num_points_.z)) / num_points_.z;
   int z = (coord % (num_points_.y * num_points_.z)) % num_points_.z;
@@ -1258,40 +1206,6 @@ void Grid3D::ApplyAbs() {
     data_[i] = std::fabs(data_[i]);
   }
 }
-
-int Grid3D::LinearIndex(int i, int j, int k) const {
-  return i * num_points_.y * num_points_.z + j * num_points_.z + k;
-}
-
-std::string Grid3D::CompareGridMetaData(const Grid3D& other) const {
-  if (num_points_ != other.num_points_) {
-    return "grids have different number of points";
-  }
-  if (data_.size() != other.data_.size()) {
-    return "grids have different sizes";
-  }
-  if (p0_ != other.p0_) {
-    return "grids have different start points";
-  }
-  if (pN_ != other.pN_) {
-    return "grids have different end points";
-  } if (delta_ != other.delta_) {
-    return "grids have different delta between points";
-  }
-  return "OK";
-}
-
-void Grid3D::InitVectors() {
-  left_xyz.resize(3);
-  right_xyz.resize(3);
-
-  left_xyz[0].resize(num_points_.y * num_points_.z, 0.0);
-  left_xyz[1].resize(num_points_.x * num_points_.z, 0.0);
-  left_xyz[2].resize(num_points_.x * num_points_.y, 0.0);
-
-  right_xyz[0].resize(num_points_.y * num_points_.z, 0.0);
-  right_xyz[1].resize(num_points_.x * num_points_.z, 0.0);
-  right_xyz[2].resize(num_points_.x * num_points_.y, 0.0);
-}
+*/
 
 } // namespace grid
